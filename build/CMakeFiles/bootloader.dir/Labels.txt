@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+C:/Users/roma/Desktop/ESP32-S3-Access-Controller/access-control/build/CMakeFiles/bootloader
+C:/Users/roma/Desktop/ESP32-S3-Access-Controller/access-control/build/CMakeFiles/bootloader.rule
+C:/Users/roma/Desktop/ESP32-S3-Access-Controller/access-control/build/CMakeFiles/bootloader-complete.rule
+C:/Users/roma/Desktop/ESP32-S3-Access-Controller/access-control/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+C:/Users/roma/Desktop/ESP32-S3-Access-Controller/access-control/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+C:/Users/roma/Desktop/ESP32-S3-Access-Controller/access-control/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+C:/Users/roma/Desktop/ESP32-S3-Access-Controller/access-control/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+C:/Users/roma/Desktop/ESP32-S3-Access-Controller/access-control/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+C:/Users/roma/Desktop/ESP32-S3-Access-Controller/access-control/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+C:/Users/roma/Desktop/ESP32-S3-Access-Controller/access-control/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule
