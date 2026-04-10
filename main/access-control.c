@@ -5,18 +5,21 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
+#include "freertos/queue.h"
 
 static const char *TAG = "PC_LOCK";
 
 /* System state */
 static bool pc_is_locked = false;
 static float filtered_distance = 0.0;
+
+/* RTOS Components */
+static QueueHandle_t rssi_queue;
 
 /* RSSI Config */
 #define MEASURED_POWER -60  // RSSI at 1m
@@ -51,6 +54,40 @@ static void ble_app_scan(void) {
     }
 }
 
+/* ---------------------------------------------------------
+ * RTOS TASK: SECURITY LOGIC (Consumer)
+ * --------------------------------------------------------- */
+void security_task(void *pvParameters) {
+    int8_t current_rssi;
+
+    ESP_LOGI(TAG, "Security Task started. Waiting for RSSI data...");
+
+    while (1) {
+        if (xQueueReceive(rssi_queue, &current_rssi, portMAX_DELAY) == pdPASS) {
+            
+            float raw_distance = pow(10, (float)(MEASURED_POWER - current_rssi) / (10 * N_COEFF));
+
+            if (filtered_distance == 0.0) {
+                filtered_distance = raw_distance;
+            } else {
+                filtered_distance = (ALPHA * raw_distance) + ((1.0 - ALPHA) * filtered_distance);
+            }
+
+            ESP_LOGD(TAG, "RSSI: %d | Dist: %.2fm", current_rssi, filtered_distance);
+
+            if (filtered_distance > THRESHOLD_LOCK && !pc_is_locked) {
+                printf("CMD_LOCK_PC\n");
+                pc_is_locked = true;
+                ESP_LOGI(TAG, "Threshold exceeded. PC locked.");
+            } 
+            else if (filtered_distance < THRESHOLD_RESET && pc_is_locked) {
+                pc_is_locked = false;
+                ESP_LOGI(TAG, "Target in range. PC unlocked.");
+            }
+        }
+    }
+}
+
 static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
     struct ble_hs_adv_fields fields;
     int rc;
@@ -64,26 +101,9 @@ static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
                 if (fields.name_len == strlen(TARGET_DEVICE_NAME) && 
                     strncmp((char *)fields.name, TARGET_DEVICE_NAME, fields.name_len) == 0) {
                     
-                    float raw_distance = pow(10, (float)(MEASURED_POWER - event->disc.rssi) / (10 * N_COEFF));
-
-                    if (filtered_distance == 0.0) {
-                        filtered_distance = raw_distance;
-                    } else {
-                        filtered_distance = (ALPHA * raw_distance) + ((1.0 - ALPHA) * filtered_distance);
-                    }
-
-                    // Змінив рівень логування на DEBUG, щоб не засмічувати консоль кожну секунду
-                    ESP_LOGD(TAG, "RSSI: %d | Dist: %.2fm", event->disc.rssi, filtered_distance);
-
-                    if (filtered_distance > THRESHOLD_LOCK && !pc_is_locked) {
-                        printf("CMD_LOCK_PC\n");
-                        pc_is_locked = true;
-                        ESP_LOGI(TAG, "Threshold exceeded. PC locked.");
-                    } 
-                    else if (filtered_distance < THRESHOLD_RESET && pc_is_locked) {
-                        pc_is_locked = false;
-                        ESP_LOGI(TAG, "Target in range. PC unlocked.");
-                    }
+                    int8_t rssi = event->disc.rssi;
+                    
+                    xQueueSend(rssi_queue, &rssi, 0);
                 }
             }
             return 0;
@@ -115,15 +135,19 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // Initialize NimBLE
+    rssi_queue = xQueueCreate(10, sizeof(int8_t));
+    if (rssi_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create queue!");
+        return;
+    }
+
+    xTaskCreate(security_task, "security_task", 4096, NULL, 5, NULL);
+
     ESP_ERROR_CHECK(nimble_port_init());
     ble_hs_cfg.sync_cb = ble_app_on_sync;
     ble_svc_gap_device_name_set("ESP32S3-Lock");
 
     nimble_port_freertos_init(ble_host_task);
 
-    // Heartbeat loop
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
+    vTaskDelete(NULL); 
 }
