@@ -84,11 +84,17 @@ void security_task(void *pvParameters) {
             if (pc_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
                 if (filtered_distance > THRESHOLD_LOCK && !pc_is_locked) {
                     pc_is_locked = true;
-                    ESP_LOGI(TAG, "Target lost. Sending lock command to PC...");
+                    ESP_LOGI(TAG, "Target lost. Sending Win + L to lock PC...");
+                    
+                    // Відправка Win + L
+                    ble_hid_send_key(pc_conn_handle, 0x08, 0x0F);
                 } 
                 else if (filtered_distance < THRESHOLD_RESET && pc_is_locked) {
                     pc_is_locked = false;
-                    ESP_LOGI(TAG, "Target in range. Sending unlock command to PC...");
+                    ESP_LOGI(TAG, "Target in range. Waking up PC...");
+                    
+                    // Відправка Пробілу (щоб розбудити екран)
+                    ble_hid_send_key(pc_conn_handle, 0x00, 0x2C);
                 }
             }
         }
