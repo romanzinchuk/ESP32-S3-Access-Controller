@@ -204,16 +204,15 @@ void gatt_svr_init(void) {
 void ble_hid_send_key(uint16_t conn_handle, uint8_t modifier, uint8_t key_code) {
     if (conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
 
-    // 1. Press the key
     uint8_t press_report[8] = {modifier, 0, key_code, 0, 0, 0, 0, 0};
     struct os_mbuf *om = ble_hs_mbuf_from_flat(press_report, sizeof(press_report));
     ble_gatts_notify_custom(conn_handle, hid_input_handle, om);
 
-    // 2. Wait a bit (simulate a human finger pressing a mechanical switch)
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(150));
 
-    // 3. Release the key (send all zeros)
     uint8_t release_report[8] = {0};
     om = ble_hs_mbuf_from_flat(release_report, sizeof(release_report));
     ble_gatts_notify_custom(conn_handle, hid_input_handle, om);
+    
+    vTaskDelay(pdMS_TO_TICKS(50));
 }

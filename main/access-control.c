@@ -73,34 +73,33 @@ void security_task(void *pvParameters) {
     ESP_LOGI(TAG, "Security Task started. Waiting for RSSI data...");
 
     while (1) {
-        if (xQueueReceive(rssi_queue, &current_rssi, portMAX_DELAY) == pdPASS) {
+        if (xQueueReceive(rssi_queue, &current_rssi, pdMS_TO_TICKS(10000)) == pdPASS) {
             
             float raw_distance = pow(10, (float)(MEASURED_POWER - current_rssi) / (10 * N_COEFF));
 
             if (filtered_distance == 0.0) {
                 filtered_distance = raw_distance;
             } else {
-                filtered_distance = (ALPHA * raw_distance) + ((1.0 - ALPHA) * filtered_distance);
+                filtered_distance = (0.05 * raw_distance) + (0.95 * filtered_distance);
             }
 
             ESP_LOGD(TAG, "RSSI: %d | Dist: %.2fm", current_rssi, filtered_distance);
 
-            // Execute lock/unlock logic ONLY if PC is connected
-            if (pc_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-                if (filtered_distance > THRESHOLD_LOCK && !pc_is_locked) {
-                    pc_is_locked = true;
-                    ESP_LOGI(TAG, "Target lost. Sending Win + L to lock PC...");
-                    
-                    // Відправка Win + L
-                    ble_hid_send_key(pc_conn_handle, 0x08, 0x0F);
-                } 
-                else if (filtered_distance < THRESHOLD_RESET && pc_is_locked) {
-                    pc_is_locked = false;
-                    ESP_LOGI(TAG, "Target in range. Waking up PC...");
-                    
-                    // Відправка Пробілу (щоб розбудити екран)
-                    ble_hid_send_key(pc_conn_handle, 0x00, 0x2C);
-                }
+        } else {
+            ESP_LOGW(TAG, "Watch signal timeout! Forcing maximum distance.");
+            filtered_distance = 10.0;
+        }
+
+        if (pc_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+            if (filtered_distance > THRESHOLD_LOCK && !pc_is_locked) {
+                pc_is_locked = true;
+                ESP_LOGI(TAG, "Target lost. Sending Win + L to lock PC...");
+                ble_hid_send_key(pc_conn_handle, 0x08, 0x0F);
+            } 
+            else if (filtered_distance < THRESHOLD_RESET && pc_is_locked) {
+                pc_is_locked = false;
+                ESP_LOGI(TAG, "Target in range. Waking up PC...");
+                ble_hid_send_key(pc_conn_handle, 0x00, 0x2C);
             }
         }
     }
@@ -203,7 +202,7 @@ void ble_host_task(void *param) {
 void app_main(void) {
 esp_err_t ret;
 
-    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x05};
+    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x07};
     esp_base_mac_addr_set(new_mac);
 
     ESP_ERROR_CHECK(nvs_flash_erase());
