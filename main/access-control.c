@@ -39,14 +39,9 @@ static int ble_app_gap_event(struct ble_gap_event *event, void *arg);
 static void ble_app_advertise(void);
 
 static void ble_app_scan(void) {
-
     if (ble_gap_disc_active()) {
-        return; 
+        return;
     }
-
-    uint8_t own_addr_type;
-    struct ble_gap_disc_params disc_params = {0};
-    int rc;
 
     uint8_t own_addr_type;
     struct ble_gap_disc_params disc_params = {0};
@@ -208,9 +203,9 @@ void ble_host_task(void *param) {
 void app_main(void) {
 esp_err_t ret;
 
-    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x04};
+    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x05};
     esp_base_mac_addr_set(new_mac);
-    
+
     ESP_ERROR_CHECK(nvs_flash_erase());
     ESP_ERROR_CHECK(nvs_flash_init());
 

@@ -113,6 +113,15 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                 .access_cb = gatt_svr_access_hid,
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &hid_input_handle,
+                .descriptors = (struct ble_gatt_dsc_def[]) {
+                    {
+                        /* Report Reference Descriptor (Критично для Windows) */
+                        .uuid = BLE_UUID16_DECLARE(0x2908),
+                        .access_cb = gatt_svr_access_hid,
+                        .att_flags = BLE_ATT_F_READ,
+                    },
+                    { 0 }
+                }
             },
             { 0 }
         }
@@ -142,8 +151,15 @@ static int gatt_svr_access_battery(uint16_t conn_handle, uint16_t attr_handle, s
 }
 
 static int gatt_svr_access_hid(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg) {
-    uint16_t uuid16 = ble_uuid_u16(ctxt->chr->uuid);
+    uint16_t uuid16 = 0;
     
+    // Визначаємо, що саме читає Windows: характеристику чи дескриптор
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR || ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        uuid16 = ble_uuid_u16(ctxt->chr->uuid);
+    } else if (ctxt->op == BLE_GATT_ACCESS_OP_READ_DSC || ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
+        uuid16 = ble_uuid_u16(ctxt->dsc->uuid);
+    }
+
     if (uuid16 == 0x2A4A) { 
         uint8_t hid_info[] = {0x11, 0x01, 0x00, 0x03}; 
         os_mbuf_append(ctxt->om, hid_info, sizeof(hid_info));
@@ -159,6 +175,12 @@ static int gatt_svr_access_hid(uint16_t conn_handle, uint16_t attr_handle, struc
             os_mbuf_append(ctxt->om, empty_report, sizeof(empty_report));
             return 0;
         }
+    }
+    if (uuid16 == 0x2908) { 
+        // Report Reference: Report ID = 1, Type = 1 (Input)
+        uint8_t rep_ref[] = {0x01, 0x01}; 
+        os_mbuf_append(ctxt->om, rep_ref, sizeof(rep_ref));
+        return 0;
     }
     return 0;
 }
