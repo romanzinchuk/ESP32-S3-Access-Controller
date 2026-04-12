@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -108,10 +109,12 @@ static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
     switch (event->type) {
         
         /* ROLE 1: PERIPHERAL (PC connects/disconnects) */
-        case BLE_GAP_EVENT_CONNECT:
+       case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
                 pc_conn_handle = event->connect.conn_handle;
                 ESP_LOGI(TAG, "PC Connected successfully!");
+                // STOP scanning to stabilize connection
+                ble_gap_disc_cancel(); 
             } else {
                 ESP_LOGE(TAG, "Connection failed; status=%d", event->connect.status);
                 ble_app_advertise();
@@ -121,6 +124,8 @@ static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "PC Disconnected. Reason: %d", event->disconnect.reason);
             pc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            // Restart scanning and advertising
+            ble_app_scan();
             ble_app_advertise();
             return 0;
 
@@ -142,6 +147,10 @@ static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
  * ADVERTISING FOR PC
  * --------------------------------------------------------- */
 static void ble_app_advertise(void) {
+    if (ble_gap_adv_active()) {
+        return; // Already advertising, do nothing
+    }
+    
     struct ble_gap_adv_params adv_params;
     struct ble_hs_adv_fields fields;
     const char *name;
@@ -178,6 +187,7 @@ static void ble_app_advertise(void) {
     } else {
         ESP_LOGI(TAG, "Advertising to PC started...");
     }
+    
 }
 
 static void ble_app_on_sync(void) {
@@ -194,6 +204,16 @@ void ble_host_task(void *param) {
 
 void app_main(void) {
     esp_err_t ret;
+
+    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02};
+    esp_base_mac_addr_set(new_mac);
+
+    ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
 
     ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -222,7 +242,7 @@ void app_main(void) {
     ble_hs_cfg.sync_cb = ble_app_on_sync;
 
     /* Встановлюємо ім'я */
-    ble_svc_gap_device_name_set("ESP32S3-Lock");
+    ble_svc_gap_device_name_set("ESP32-Security-Key");
     
     /* Initialize GATT Server from external file */
     gatt_svr_init();
