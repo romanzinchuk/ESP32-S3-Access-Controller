@@ -39,6 +39,15 @@ static int ble_app_gap_event(struct ble_gap_event *event, void *arg);
 static void ble_app_advertise(void);
 
 static void ble_app_scan(void) {
+
+    if (ble_gap_disc_active()) {
+        return; 
+    }
+
+    uint8_t own_addr_type;
+    struct ble_gap_disc_params disc_params = {0};
+    int rc;
+
     uint8_t own_addr_type;
     struct ble_gap_disc_params disc_params = {0};
     int rc;
@@ -109,29 +118,23 @@ static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
     switch (event->type) {
         
         /* ROLE 1: PERIPHERAL (PC connects/disconnects) */
-       case BLE_GAP_EVENT_CONNECT:
+        case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
                 pc_conn_handle = event->connect.conn_handle;
                 ESP_LOGI(TAG, "PC Connected successfully!");
-                // STOP scanning to stabilize connection
-                ble_gap_disc_cancel(); 
             } else {
                 ESP_LOGE(TAG, "Connection failed; status=%d", event->connect.status);
-                ble_app_advertise();
             }
             return 0;
 
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "PC Disconnected. Reason: %d", event->disconnect.reason);
             pc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            // Restart scanning and advertising
-            ble_app_scan();
             ble_app_advertise();
             return 0;
 
         /* ROLE 2: SCANNER (Looking for the watch) */
         case BLE_GAP_EVENT_DISC:
-            // Compare scanned MAC with target MAC
             if (memcmp(event->disc.addr.val, TARGET_MAC, 6) == 0) {
                 int8_t rssi = event->disc.rssi;
                 xQueueSend(rssi_queue, &rssi, 0);
@@ -203,10 +206,15 @@ void ble_host_task(void *param) {
 }
 
 void app_main(void) {
-    esp_err_t ret;
+esp_err_t ret;
 
-    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02};
+    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x04};
     esp_base_mac_addr_set(new_mac);
+    
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ESP_ERROR_CHECK(nvs_flash_init());
+
+    rssi_queue = xQueueCreate(10, sizeof(int8_t));
 
     ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -242,7 +250,7 @@ void app_main(void) {
     ble_hs_cfg.sync_cb = ble_app_on_sync;
 
     /* Встановлюємо ім'я */
-    ble_svc_gap_device_name_set("ESP32-Security-Key");
+    ble_svc_gap_device_name_set("ESP-Key-V2");
     
     /* Initialize GATT Server from external file */
     gatt_svr_init();
