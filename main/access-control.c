@@ -16,31 +16,37 @@
 
 static const char *TAG = "PC_LOCK";
 
-/* Target IMISW12 MAC Address (Little Endian) */
+/* Target smartwatch MAC Address (Little Endian format for NimBLE) */
 static const uint8_t TARGET_MAC[6] = {0x9F, 0x68, 0x07, 0xB7, 0x02, 0x78};
 
-/* System state */
+/* System state tracking */
 static bool pc_is_locked = false;
 static float filtered_distance = 0.0;
 static uint16_t pc_conn_handle = BLE_HS_CONN_HANDLE_NONE; 
 
-/* RTOS Components */
+/* RTOS communication */
 static QueueHandle_t rssi_queue;
 
-/* RSSI Config */
-#define MEASURED_POWER -60  // RSSI at 1m
-#define N_COEFF 3.0         // Environmental factor
-#define ALPHA 0.15          // EMA filter coefficient
-#define THRESHOLD_LOCK 2.0  // Lock distance (m)
-#define THRESHOLD_RESET 1.5 // Unlock distance (m)
+/* Distance calculation and filtering constants */
+#define MEASURED_POWER -60  // Expected RSSI at 1 meter distance
+#define N_COEFF 3.0         // Environmental signal loss factor
+#define ALPHA 0.05          // Exponential Moving Average (EMA) filter coefficient
+#define THRESHOLD_LOCK 2.0  // Distance (in meters) to trigger PC lock
+#define THRESHOLD_RESET 1.5 // Distance (in meters) to trigger PC unlock
 
-/* Declarations */
+/* Function declarations */
 static int ble_app_gap_event(struct ble_gap_event *event, void *arg);
 static void ble_app_advertise(void);
 
+/* * Configures and starts the BLE scanner to find the target smartwatch.
+ * Uses a "Hard Reset" approach to prevent the BLE controller from 
+ * silently dropping the scan process during PC connections.
+ */
 static void ble_app_scan(void) {
+    // Forcefully cancel active scanning to clear radio buffers
     if (ble_gap_disc_active()) {
-        return;
+        ble_gap_disc_cancel();
+        vTaskDelay(pdMS_TO_TICKS(20)); 
     }
 
     uint8_t own_addr_type;
@@ -54,18 +60,23 @@ static void ble_app_scan(void) {
     }
 
     disc_params.filter_duplicates = 0; 
-    disc_params.passive = 1;
+    disc_params.passive = 0; // Active scanning (sends scan requests)
     
+    // 50% Duty Cycle (100ms interval, 50ms window) to share radio with HID
+    disc_params.itvl = 160; 
+    disc_params.window = 80; 
+
     rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &disc_params, ble_app_gap_event, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "Scan start failed (rc=%d)", rc);
     } else {
-        ESP_LOGI(TAG, "Scanning for target MAC started");
+        ESP_LOGI(TAG, "Scanning for target MAC started (HARD RESET)");
     }
 }
 
 /* ---------------------------------------------------------
- * RTOS TASK: SECURITY LOGIC (Consumer)
+ * RTOS TASK: SECURITY LOGIC
+ * Processes RSSI data, calculates distance, and triggers HID commands.
  * --------------------------------------------------------- */
 void security_task(void *pvParameters) {
     int8_t current_rssi;
@@ -73,49 +84,77 @@ void security_task(void *pvParameters) {
     ESP_LOGI(TAG, "Security Task started. Waiting for RSSI data...");
 
     while (1) {
+        // Wait up to 10 seconds for a new RSSI packet from the watch
         if (xQueueReceive(rssi_queue, &current_rssi, pdMS_TO_TICKS(10000)) == pdPASS) {
             
+            // Logarithmic distance calculation
             float raw_distance = pow(10, (float)(MEASURED_POWER - current_rssi) / (10 * N_COEFF));
 
+            // Apply EMA filter to smooth out signal spikes and reflections
             if (filtered_distance == 0.0) {
                 filtered_distance = raw_distance;
             } else {
-                filtered_distance = (0.05 * raw_distance) + (0.95 * filtered_distance);
+                filtered_distance = (ALPHA * raw_distance) + ((1.0 - ALPHA) * filtered_distance);
             }
 
             ESP_LOGD(TAG, "RSSI: %d | Dist: %.2fm", current_rssi, filtered_distance);
 
         } else {
+            // Timeout: Watch is out of range or in deep sleep
             ESP_LOGW(TAG, "Watch signal timeout! Forcing maximum distance.");
-            filtered_distance = 10.0;
+            filtered_distance = 10.0; 
         }
 
+        // HID Command Logic (Only execute if connected to PC)
         if (pc_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+            
+            // Lock Condition: User walked away
             if (filtered_distance > THRESHOLD_LOCK && !pc_is_locked) {
                 pc_is_locked = true;
-                ESP_LOGI(TAG, "Target lost. Sending Win + L to lock PC...");
-                ble_hid_send_key(pc_conn_handle, 0x08, 0x0F);
+                ESP_LOGI(TAG, "Target lost. Pausing scanner to send Win + L...");
+                
+                // Pause scanner to give 100% radio priority to HID transmission
+                if (ble_gap_disc_active()) ble_gap_disc_cancel(); 
+                vTaskDelay(pdMS_TO_TICKS(100)); 
+
+                ble_hid_send_key(pc_conn_handle, 0x08, 0x0F); // Win + L
+
+                // Resume scanner after successful transmission
+                vTaskDelay(pdMS_TO_TICKS(100));
+                ble_app_scan();
             } 
+            // Unlock Condition: User returned
             else if (filtered_distance < THRESHOLD_RESET && pc_is_locked) {
                 pc_is_locked = false;
-                ESP_LOGI(TAG, "Target in range. Waking up PC...");
-                ble_hid_send_key(pc_conn_handle, 0x00, 0x2C);
+                ESP_LOGI(TAG, "Target in range. Pausing scanner to wake up PC...");
+                
+                if (ble_gap_disc_active()) ble_gap_disc_cancel();
+                vTaskDelay(pdMS_TO_TICKS(100));
+
+                ble_hid_send_key(pc_conn_handle, 0x00, 0x2C); // Spacebar
+
+                vTaskDelay(pdMS_TO_TICKS(100));
+                ble_app_scan();
             }
         }
     }
 }
 
 /* ---------------------------------------------------------
- * BLE GAP EVENT HANDLER (Dual Role Brain)
+ * BLE GAP EVENT HANDLER 
+ * Manages dual-role operations: PC connection and Watch scanning.
  * --------------------------------------------------------- */
 static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
     switch (event->type) {
         
-        /* ROLE 1: PERIPHERAL (PC connects/disconnects) */
+        /* ROLE 1: PERIPHERAL (Handling Windows PC) */
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
                 pc_conn_handle = event->connect.conn_handle;
                 ESP_LOGI(TAG, "PC Connected successfully!");
+                
+                // Restart scanner. Controller often aborts scanning upon connection.
+                ble_app_scan(); 
             } else {
                 ESP_LOGE(TAG, "Connection failed; status=%d", event->connect.status);
             }
@@ -124,13 +163,15 @@ static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "PC Disconnected. Reason: %d", event->disconnect.reason);
             pc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            ble_app_advertise();
+            ble_app_advertise(); // Resume broadcasting to PC
             return 0;
 
-        /* ROLE 2: SCANNER (Looking for the watch) */
+        /* ROLE 2: CENTRAL (Scanning for Watch) */
         case BLE_GAP_EVENT_DISC:
+            // Filter incoming packets by target MAC address
             if (memcmp(event->disc.addr.val, TARGET_MAC, 6) == 0) {
                 int8_t rssi = event->disc.rssi;
+                // Send RSSI to RTOS task (non-blocking)
                 xQueueSend(rssi_queue, &rssi, 0);
             }
             return 0;
@@ -142,11 +183,10 @@ static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
 
 /* ---------------------------------------------------------
  * ADVERTISING FOR PC
+ * Configures ESP32 to appear as an HID Keyboard to Windows.
  * --------------------------------------------------------- */
 static void ble_app_advertise(void) {
-    if (ble_gap_adv_active()) {
-        return; // Already advertising, do nothing
-    }
+    if (ble_gap_adv_active()) return; 
     
     struct ble_gap_adv_params adv_params;
     struct ble_hs_adv_fields fields;
@@ -164,7 +204,7 @@ static void ble_app_advertise(void) {
     fields.name_len = strlen(name);
     fields.name_is_complete = 1;
 
-    // Appearance 0x03C1 indicates a Keyboard
+    // 0x03C1 dictates the device icon and driver type (Keyboard) in Windows
     fields.appearance = 0x03C1; 
     fields.appearance_is_present = 1;
 
@@ -184,15 +224,16 @@ static void ble_app_advertise(void) {
     } else {
         ESP_LOGI(TAG, "Advertising to PC started...");
     }
-    
 }
 
+/* Synchronization callback when NimBLE host and controller are synced */
 static void ble_app_on_sync(void) {
     ble_hs_util_ensure_addr(0);
     ble_app_advertise();
     ble_app_scan();
 }
 
+/* Dedicated RTOS task for NimBLE host stack */
 void ble_host_task(void *param) {
     ESP_LOGI(TAG, "BLE Host Task started");
     nimble_port_run();
@@ -200,30 +241,15 @@ void ble_host_task(void *param) {
 }
 
 void app_main(void) {
-esp_err_t ret;
-
-    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x07};
+    // Override default MAC to force a clean pairing state in Windows
+    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x0C};
     esp_base_mac_addr_set(new_mac);
 
+    // Initialize Non-Volatile Storage (NVS) for BLE bonding keys
     ESP_ERROR_CHECK(nvs_flash_erase());
     ESP_ERROR_CHECK(nvs_flash_init());
 
-    rssi_queue = xQueueCreate(10, sizeof(int8_t));
-
-    ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
+    // Create RTOS queue for RSSI data passing
     rssi_queue = xQueueCreate(10, sizeof(int8_t));
     if (rssi_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create queue!");
@@ -234,22 +260,19 @@ esp_err_t ret;
 
     ESP_ERROR_CHECK(nimble_port_init());
     
-    /* Configure Security Manager (Required for HID) */
-    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO; 
-    ble_hs_cfg.sm_bonding = 1;                  
-    ble_hs_cfg.sm_mitm = 0;
-    ble_hs_cfg.sm_sc = 1;                       
+    /* Security Manager Configuration (Strictly required for HID pairing) */
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO; // No display or keyboard for PIN
+    ble_hs_cfg.sm_bonding = 1;                  // Save pairing keys to NVS
+    ble_hs_cfg.sm_mitm = 0;                     // Man-in-the-Middle protection off
+    ble_hs_cfg.sm_sc = 1;                       // Secure Connections enabled
     ble_hs_cfg.sm_our_key_dist = 1;
     ble_hs_cfg.sm_their_key_dist = 1;
     ble_hs_cfg.sync_cb = ble_app_on_sync;
 
-    /* Встановлюємо ім'я */
     ble_svc_gap_device_name_set("ESP-Key-V2");
     
-    /* Initialize GATT Server from external file */
-    gatt_svr_init();
-
+    gatt_svr_init(); // Initialize custom HID descriptors
     nimble_port_freertos_init(ble_host_task);
 
-    vTaskDelete(NULL); 
+    vTaskDelete(NULL); // Delete main task as FreeRTOS takes over
 }
