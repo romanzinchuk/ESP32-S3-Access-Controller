@@ -28,8 +28,8 @@ static uint16_t pc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static QueueHandle_t rssi_queue;
 
 /* Distance calculation and filtering constants */
-#define MEASURED_POWER -60  // Expected RSSI at 1 meter distance
-#define N_COEFF 3.0         // Environmental signal loss factor
+#define MEASURED_POWER -70  // Expected RSSI at 1 meter distance
+#define N_COEFF 2.5         // Environmental signal loss factor
 #define ALPHA 0.05          // Exponential Moving Average (EMA) filter coefficient
 #define THRESHOLD_LOCK 2.0  // Distance (in meters) to trigger PC lock
 #define THRESHOLD_RESET 1.5 // Distance (in meters) to trigger PC unlock
@@ -43,12 +43,6 @@ static void ble_app_advertise(void);
  * silently dropping the scan process during PC connections.
  */
 static void ble_app_scan(void) {
-    // Forcefully cancel active scanning to clear radio buffers
-    if (ble_gap_disc_active()) {
-        ble_gap_disc_cancel();
-        vTaskDelay(pdMS_TO_TICKS(20)); 
-    }
-
     uint8_t own_addr_type;
     struct ble_gap_disc_params disc_params = {0};
     int rc;
@@ -59,10 +53,15 @@ static void ble_app_scan(void) {
         return;
     }
 
+    // Якщо сканування вже активне, не намагаємось його перервати чи перезапустити
+    if (ble_gap_disc_active()) {
+        return;
+    }
+
     disc_params.filter_duplicates = 0; 
-    disc_params.passive = 0; // Active scanning (sends scan requests)
+    disc_params.passive = 1; // Пасивне сканування - тільки слухаємо пакети, не навантажуємо ефір
     
-    // 50% Duty Cycle (100ms interval, 50ms window) to share radio with HID
+    // 50% Duty Cycle
     disc_params.itvl = 160; 
     disc_params.window = 80; 
 
@@ -70,7 +69,7 @@ static void ble_app_scan(void) {
     if (rc != 0) {
         ESP_LOGE(TAG, "Scan start failed (rc=%d)", rc);
     } else {
-        ESP_LOGI(TAG, "Scanning for target MAC started (HARD RESET)");
+        ESP_LOGI(TAG, "Scanning for target MAC started");
     }
 }
 
@@ -80,61 +79,44 @@ static void ble_app_scan(void) {
  * --------------------------------------------------------- */
 void security_task(void *pvParameters) {
     int8_t current_rssi;
+    bool in_timeout = false; // Додано змінну для відстеження стану таймауту
 
     ESP_LOGI(TAG, "Security Task started. Waiting for RSSI data...");
 
     while (1) {
-        // Wait up to 10 seconds for a new RSSI packet from the watch
         if (xQueueReceive(rssi_queue, &current_rssi, pdMS_TO_TICKS(10000)) == pdPASS) {
             
-            // Logarithmic distance calculation
             float raw_distance = pow(10, (float)(MEASURED_POWER - current_rssi) / (10 * N_COEFF));
 
-            // Apply EMA filter to smooth out signal spikes and reflections
-            if (filtered_distance == 0.0) {
+            // Якщо це перший запуск АБО ми щойно вийшли з таймауту - скидаємо фільтр
+            if (filtered_distance == 0.0 || in_timeout) {
                 filtered_distance = raw_distance;
+                in_timeout = false; 
             } else {
                 filtered_distance = (ALPHA * raw_distance) + ((1.0 - ALPHA) * filtered_distance);
             }
 
-            ESP_LOGD(TAG, "RSSI: %d | Dist: %.2fm", current_rssi, filtered_distance);
+            ESP_LOGI(TAG, "RSSI: %d | Raw Dist: %.2fm | Filtered Dist: %.2fm", current_rssi, raw_distance, filtered_distance);
 
         } else {
-            // Timeout: Watch is out of range or in deep sleep
             ESP_LOGW(TAG, "Watch signal timeout! Forcing maximum distance.");
             filtered_distance = 10.0; 
+            in_timeout = true; // Фіксуємо, що стався таймаут
         }
 
-        // HID Command Logic (Only execute if connected to PC)
         if (pc_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
             
-            // Lock Condition: User walked away
             if (filtered_distance > THRESHOLD_LOCK && !pc_is_locked) {
                 pc_is_locked = true;
-                ESP_LOGI(TAG, "Target lost. Pausing scanner to send Win + L...");
+                ESP_LOGI(TAG, "Target lost. Sending Win + L...");
                 
-                // Pause scanner to give 100% radio priority to HID transmission
-                if (ble_gap_disc_active()) ble_gap_disc_cancel(); 
-                vTaskDelay(pdMS_TO_TICKS(100)); 
-
-                ble_hid_send_key(pc_conn_handle, 0x08, 0x0F); // Win + L
-
-                // Resume scanner after successful transmission
-                vTaskDelay(pdMS_TO_TICKS(100));
-                ble_app_scan();
+                ble_hid_send_key(pc_conn_handle, 0x08, 0x0F); 
             } 
-            // Unlock Condition: User returned
             else if (filtered_distance < THRESHOLD_RESET && pc_is_locked) {
                 pc_is_locked = false;
-                ESP_LOGI(TAG, "Target in range. Pausing scanner to wake up PC...");
+                ESP_LOGI(TAG, "Target in range. Waking up PC...");
                 
-                if (ble_gap_disc_active()) ble_gap_disc_cancel();
-                vTaskDelay(pdMS_TO_TICKS(100));
-
-                ble_hid_send_key(pc_conn_handle, 0x00, 0x2C); // Spacebar
-
-                vTaskDelay(pdMS_TO_TICKS(100));
-                ble_app_scan();
+                ble_hid_send_key(pc_conn_handle, 0x00, 0x2C); 
             }
         }
     }
@@ -147,13 +129,10 @@ void security_task(void *pvParameters) {
 static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
     switch (event->type) {
         
-        /* ROLE 1: PERIPHERAL (Handling Windows PC) */
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
                 pc_conn_handle = event->connect.conn_handle;
                 ESP_LOGI(TAG, "PC Connected successfully!");
-                
-                // Restart scanner. Controller often aborts scanning upon connection.
                 ble_app_scan(); 
             } else {
                 ESP_LOGE(TAG, "Connection failed; status=%d", event->connect.status);
@@ -163,17 +142,20 @@ static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "PC Disconnected. Reason: %d", event->disconnect.reason);
             pc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            ble_app_advertise(); // Resume broadcasting to PC
+            ble_app_advertise(); 
             return 0;
 
-        /* ROLE 2: CENTRAL (Scanning for Watch) */
         case BLE_GAP_EVENT_DISC:
-            // Filter incoming packets by target MAC address
             if (memcmp(event->disc.addr.val, TARGET_MAC, 6) == 0) {
                 int8_t rssi = event->disc.rssi;
-                // Send RSSI to RTOS task (non-blocking)
                 xQueueSend(rssi_queue, &rssi, 0);
             }
+            return 0;
+
+        /* ОБОВ'ЯЗКОВИЙ ІВЕНТ: Обробка зупинки сканування */
+        case BLE_GAP_EVENT_DISC_COMPLETE:
+            ESP_LOGW(TAG, "Scanning stopped (reason: %d). Restarting...", event->disc_complete.reason);
+            ble_app_scan();
             return 0;
 
         default:
@@ -242,7 +224,7 @@ void ble_host_task(void *param) {
 
 void app_main(void) {
     // Override default MAC to force a clean pairing state in Windows
-    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x0C};
+    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x0F};
     esp_base_mac_addr_set(new_mac);
 
     // Initialize Non-Volatile Storage (NVS) for BLE bonding keys
