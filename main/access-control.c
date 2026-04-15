@@ -30,9 +30,14 @@ static QueueHandle_t rssi_queue;
 /* Distance calculation and filtering constants */
 #define MEASURED_POWER -70  // Expected RSSI at 1 meter distance
 #define N_COEFF 2.5         // Environmental signal loss factor
-#define ALPHA 0.05          // Exponential Moving Average (EMA) filter coefficient
+// Adaptive EMA Constants
+#define ALPHA_BASE 0.05     // Slow filter for static noise (sitting at desk)
+#define ALPHA_FAST 0.25     // Fast filter for real movement (walking away)
+#define DIFF_THRESHOLD 1.5  // Distance diff to trigger fast filter
+
 #define THRESHOLD_LOCK 2.0  // Distance (in meters) to trigger PC lock
 #define THRESHOLD_RESET 1.5 // Distance (in meters) to trigger PC unlock
+#define GRACE_PERIOD_MS 60000 // 60 seconds grace period for lost signal
 
 /* Function declarations */
 static int ble_app_gap_event(struct ble_gap_event *event, void *arg);
@@ -77,48 +82,62 @@ static void ble_app_scan(void) {
  * RTOS TASK: SECURITY LOGIC
  * Processes RSSI data, calculates distance, and triggers HID commands.
  * --------------------------------------------------------- */
+/* ---------------------------------------------------------
+ * RTOS TASK: SECURITY LOGIC
+ * Processes RSSI data, calculates distance, and triggers HID commands.
+ * --------------------------------------------------------- */
 void security_task(void *pvParameters) {
     int8_t current_rssi;
-    bool in_timeout = false; // Tracks the timeout state
+    bool in_timeout = false;
+    TickType_t last_seen_ticks = xTaskGetTickCount(); // Записуємо час старту
 
     ESP_LOGI(TAG, "Security Task started. Waiting for RSSI data...");
 
     while (1) {
-        // Wait up to 10 seconds for a new RSSI packet from the watch
-        if (xQueueReceive(rssi_queue, &current_rssi, pdMS_TO_TICKS(10000)) == pdPASS) {
+        // Зменшуємо час очікування до 5 секунд для частішої перевірки таймауту
+        if (xQueueReceive(rssi_queue, &current_rssi, pdMS_TO_TICKS(5000)) == pdPASS) {
             
-            // Logarithmic distance calculation
+            last_seen_ticks = xTaskGetTickCount(); // Оновлюємо час останнього успішного пакета
+            
             float raw_distance = pow(10, (float)(MEASURED_POWER - current_rssi) / (10 * N_COEFF));
 
-            // Reset the filter on the first run OR immediately after recovering from a timeout
             if (filtered_distance == 0.0 || in_timeout) {
                 filtered_distance = raw_distance;
                 in_timeout = false; 
             } else {
-                // Apply EMA filter to smooth out signal spikes and reflections
-                filtered_distance = (ALPHA * raw_distance) + ((1.0 - ALPHA) * filtered_distance);
+                // Адаптивний EMA-фільтр
+                float diff = fabs(raw_distance - filtered_distance);
+                float current_alpha = (diff > DIFF_THRESHOLD) ? ALPHA_FAST : ALPHA_BASE;
+                
+                filtered_distance = (current_alpha * raw_distance) + ((1.0 - current_alpha) * filtered_distance);
             }
 
-            ESP_LOGI(TAG, "RSSI: %d | Raw Dist: %.2fm | Filtered Dist: %.2fm", current_rssi, raw_distance, filtered_distance);
+            ESP_LOGI(TAG, "RSSI: %d | Raw: %.2fm | Filtered: %.2fm", current_rssi, raw_distance, filtered_distance);
 
         } else {
-            // Timeout: Watch is out of range or in deep sleep
-            ESP_LOGW(TAG, "Watch signal timeout! Forcing maximum distance.");
-            filtered_distance = 10.0; 
-            in_timeout = true; // Set timeout flag
+            // Пакетів не було 5 секунд. Перевіряємо, чи вийшов 60-секундний ліміт
+            TickType_t elapsed_time = (xTaskGetTickCount() - last_seen_ticks) * portTICK_PERIOD_MS;
+            
+            if (elapsed_time > GRACE_PERIOD_MS) {
+                ESP_LOGW(TAG, "Watch signal lost for >60s! Forcing lock.");
+                filtered_distance = 10.0; 
+                in_timeout = true; 
+            } else {
+                // Грейс-період: сигнал втрачено, але ми ще чекаємо
+                ESP_LOGD(TAG, "Signal degraded. Grace period active: %d/60s", (int)(elapsed_time / 1000));
+                // Не змінюємо filtered_distance, залишаємо останнє відоме значення
+            }
         }
 
         // HID Command Logic (Only execute if connected to PC)
         if (pc_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
             
-            // Lock Condition: User walked away
             if (filtered_distance > THRESHOLD_LOCK && !pc_is_locked) {
                 pc_is_locked = true;
                 ESP_LOGI(TAG, "Target lost. Sending Win + L...");
                 
                 ble_hid_send_key(pc_conn_handle, 0x08, 0x0F); 
             } 
-            // Unlock Condition: User returned
             else if (filtered_distance < THRESHOLD_RESET && pc_is_locked) {
                 pc_is_locked = false;
                 ESP_LOGI(TAG, "Target in range. Waking up PC...");
