@@ -38,10 +38,10 @@ static QueueHandle_t rssi_queue;
 static int ble_app_gap_event(struct ble_gap_event *event, void *arg);
 static void ble_app_advertise(void);
 
-/* * Configures and starts the BLE scanner to find the target smartwatch.
- * Uses a "Hard Reset" approach to prevent the BLE controller from 
- * silently dropping the scan process during PC connections.
- */
+/* ---------------------------------------------------------
+ * BLE SCANNER CONFIGURATION
+ * Configures and starts the BLE scanner to find the target smartwatch.
+ * --------------------------------------------------------- */
 static void ble_app_scan(void) {
     uint8_t own_addr_type;
     struct ble_gap_disc_params disc_params = {0};
@@ -53,15 +53,15 @@ static void ble_app_scan(void) {
         return;
     }
 
-    // Якщо сканування вже активне, не намагаємось його перервати чи перезапустити
+    // If scanning is already active, do not attempt to interrupt or restart it
     if (ble_gap_disc_active()) {
         return;
     }
 
     disc_params.filter_duplicates = 0; 
-    disc_params.passive = 1; // Пасивне сканування - тільки слухаємо пакети, не навантажуємо ефір
+    disc_params.passive = 1; // Passive scanning: only listen for packets, avoid radio transmission overhead
     
-    // 50% Duty Cycle
+    // 50% Duty Cycle (160 * 0.625ms = 100ms interval, 80 * 0.625ms = 50ms window)
     disc_params.itvl = 160; 
     disc_params.window = 80; 
 
@@ -79,39 +79,46 @@ static void ble_app_scan(void) {
  * --------------------------------------------------------- */
 void security_task(void *pvParameters) {
     int8_t current_rssi;
-    bool in_timeout = false; // Додано змінну для відстеження стану таймауту
+    bool in_timeout = false; // Tracks the timeout state
 
     ESP_LOGI(TAG, "Security Task started. Waiting for RSSI data...");
 
     while (1) {
+        // Wait up to 10 seconds for a new RSSI packet from the watch
         if (xQueueReceive(rssi_queue, &current_rssi, pdMS_TO_TICKS(10000)) == pdPASS) {
             
+            // Logarithmic distance calculation
             float raw_distance = pow(10, (float)(MEASURED_POWER - current_rssi) / (10 * N_COEFF));
 
-            // Якщо це перший запуск АБО ми щойно вийшли з таймауту - скидаємо фільтр
+            // Reset the filter on the first run OR immediately after recovering from a timeout
             if (filtered_distance == 0.0 || in_timeout) {
                 filtered_distance = raw_distance;
                 in_timeout = false; 
             } else {
+                // Apply EMA filter to smooth out signal spikes and reflections
                 filtered_distance = (ALPHA * raw_distance) + ((1.0 - ALPHA) * filtered_distance);
             }
 
             ESP_LOGI(TAG, "RSSI: %d | Raw Dist: %.2fm | Filtered Dist: %.2fm", current_rssi, raw_distance, filtered_distance);
 
         } else {
+            // Timeout: Watch is out of range or in deep sleep
             ESP_LOGW(TAG, "Watch signal timeout! Forcing maximum distance.");
             filtered_distance = 10.0; 
-            in_timeout = true; // Фіксуємо, що стався таймаут
+            in_timeout = true; // Set timeout flag
         }
 
+        // HID Command Logic (Only execute if connected to PC)
         if (pc_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
             
+            // Lock Condition: User walked away
             if (filtered_distance > THRESHOLD_LOCK && !pc_is_locked) {
                 pc_is_locked = true;
                 ESP_LOGI(TAG, "Target lost. Sending Win + L...");
                 
                 ble_hid_send_key(pc_conn_handle, 0x08, 0x0F); 
             } 
+            // Unlock Condition: User returned
             else if (filtered_distance < THRESHOLD_RESET && pc_is_locked) {
                 pc_is_locked = false;
                 ESP_LOGI(TAG, "Target in range. Waking up PC...");
@@ -129,6 +136,7 @@ void security_task(void *pvParameters) {
 static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
     switch (event->type) {
         
+        /* ROLE 1: PERIPHERAL (Handling Windows PC) */
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
                 pc_conn_handle = event->connect.conn_handle;
@@ -142,17 +150,20 @@ static int ble_app_gap_event(struct ble_gap_event *event, void *arg) {
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "PC Disconnected. Reason: %d", event->disconnect.reason);
             pc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            ble_app_advertise(); 
+            ble_app_advertise(); // Resume broadcasting to PC
             return 0;
 
+        /* ROLE 2: CENTRAL (Scanning for Watch) */
         case BLE_GAP_EVENT_DISC:
+            // Filter incoming packets by target MAC address
             if (memcmp(event->disc.addr.val, TARGET_MAC, 6) == 0) {
                 int8_t rssi = event->disc.rssi;
+                // Send RSSI to RTOS task (non-blocking)
                 xQueueSend(rssi_queue, &rssi, 0);
             }
             return 0;
 
-        /* ОБОВ'ЯЗКОВИЙ ІВЕНТ: Обробка зупинки сканування */
+        /* MANDATORY EVENT: Handle scan completion/termination */
         case BLE_GAP_EVENT_DISC_COMPLETE:
             ESP_LOGW(TAG, "Scanning stopped (reason: %d). Restarting...", event->disc_complete.reason);
             ble_app_scan();
