@@ -253,15 +253,17 @@ void ble_host_task(void *param) {
 }
 
 void app_main(void) {
-    // Override default MAC to force a clean pairing state in Windows
-    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x0F};
+    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x02, 0x01};
     esp_base_mac_addr_set(new_mac);
 
-    // Initialize Non-Volatile Storage (NVS) for BLE bonding keys
-    ESP_ERROR_CHECK(nvs_flash_erase());
-    ESP_ERROR_CHECK(nvs_flash_init());
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
 
-    // Create RTOS queue for RSSI data passing
+    // 3. Створення черги для RSSI
     rssi_queue = xQueueCreate(10, sizeof(int8_t));
     if (rssi_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create queue!");
