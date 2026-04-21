@@ -221,11 +221,9 @@ void ble_host_task(void *param) {
 }
 
 void app_main(void) {
-    // Custom MAC address for static Windows pairing
-    uint8_t new_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x02, 0x01};
+    uint8_t new_mac[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
     esp_base_mac_addr_set(new_mac);
 
-    // NVS initialization (preserves bonding keys)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -243,16 +241,17 @@ void app_main(void) {
 
     ESP_ERROR_CHECK(nimble_port_init());
     
-    // Security Manager Config (Required for HID)
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO; 
     ble_hs_cfg.sm_bonding = 1;                  
     ble_hs_cfg.sm_mitm = 0;                     
     ble_hs_cfg.sm_sc = 1;                       
-    ble_hs_cfg.sm_our_key_dist = 1;
-    ble_hs_cfg.sm_their_key_dist = 1;
+    // 3 = BLE_SM_PAIR_KEY_DIST_ENC (1) | BLE_SM_PAIR_KEY_DIST_ID (2)
+    ble_hs_cfg.sm_our_key_dist = 3; 
+    ble_hs_cfg.sm_their_key_dist = 3;
     ble_hs_cfg.sync_cb = ble_app_on_sync;
 
-    ble_svc_gap_device_name_set("ESP-Key-V2");
+    // 4. Нове ім'я, щоб обійти кеш Windows
+    ble_svc_gap_device_name_set("Smart-Lock-V3");
     
     gatt_svr_init(); 
     nimble_port_freertos_init(ble_host_task);
